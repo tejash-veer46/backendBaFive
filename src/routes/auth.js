@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import { one, run } from '../db.js'
+import { one, run, transaction } from '../db.js'
 import { HttpError, wrap, signToken, requireAuth, selfProfile, ageFrom } from '../lib.js'
 import { onNewUser } from '../demo.js'
 
@@ -28,28 +28,28 @@ router.post('/signup', wrap(async (req, res) => {
   if (typeof password !== 'string' || password.length < 6) {
     throw new HttpError(400, 'Password must be at least 6 characters')
   }
-  if (one('SELECT id FROM users WHERE email = ?', email)) {
+  if (await one('SELECT id FROM users WHERE email = ?', email)) {
     throw new HttpError(409, 'An account with this email already exists')
   }
 
   const hash = await bcrypt.hash(password, 10)
-  const { lastInsertRowid } = run(
+  const { lastInsertRowid } = await run(
     'INSERT INTO users (email, password_hash, name, department) VALUES (?, ?, ?, ?)',
     email, hash, name, str(req.body.department, 60, 'Department') ?? null,
   )
-  const user = one('SELECT * FROM users WHERE id = ?', lastInsertRowid)
+  const user = await one('SELECT * FROM users WHERE id = ?', lastInsertRowid)
   res.status(201).json({ token: signToken(user.id), user: selfProfile(user) })
 }))
 
 router.post('/login', wrap(async (req, res) => {
   const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : ''
-  const user = email && one('SELECT * FROM users WHERE email = ?', email)
+  const user = email && await one('SELECT * FROM users WHERE email = ?', email)
   const ok = user && (await bcrypt.compare(String(req.body.password ?? ''), user.password_hash))
   if (!ok) throw new HttpError(401, 'Incorrect email or password')
   res.json({ token: signToken(user.id), user: selfProfile(user) })
 }))
 
-router.get('/me', requireAuth, (req, res) => {
+router.get('/me', requireAuth, async (req, res) => {
   res.json(selfProfile(req.user))
 })
 
@@ -82,7 +82,7 @@ const validateInterests = (interests) => {
   return clean
 }
 
-router.put('/me', requireAuth, (req, res) => {
+router.put('/me', requireAuth, async (req, res) => {
   const b = req.body
   const updates = {
     name: str(b.name, 50, 'Name'),
@@ -119,24 +119,31 @@ router.put('/me', requireAuth, (req, res) => {
 
   const entries = Object.entries(updates).filter(([, v]) => v !== undefined)
   if (entries.length) {
-    run(
+    await run(
       `UPDATE users SET ${entries.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`,
       ...entries.map(([, v]) => v), req.user.id,
     )
   }
 
-  let user = one('SELECT * FROM users WHERE id = ?', req.user.id)
+  let user = await one('SELECT * FROM users WHERE id = ?', req.user.id)
   const complete = user.birthdate && user.gender && JSON.parse(user.photos).length >= 1
   if (complete && !user.onboarded) {
-    run('UPDATE users SET onboarded = 1 WHERE id = ?', user.id)
-    user = one('SELECT * FROM users WHERE id = ?', user.id)
-    onNewUser(user)
+    await run('UPDATE users SET onboarded = 1 WHERE id = ?', user.id)
+    user = await one('SELECT * FROM users WHERE id = ?', user.id)
+    await onNewUser(user)
   }
   res.json(selfProfile(user))
 })
 
-router.delete('/me', requireAuth, (req, res) => {
-  run('DELETE FROM users WHERE id = ?', req.user.id)
+router.delete('/me', requireAuth, async (req, res) => {
+  const id = req.user.id
+  await transaction(async (tx) => {
+    await tx.run('DELETE FROM messages WHERE sender_id = ? OR match_id IN (SELECT id FROM matches WHERE user_a = ? OR user_b = ?)', id, id, id)
+    await tx.run('DELETE FROM matches WHERE user_a = ? OR user_b = ?', id, id)
+    await tx.run('DELETE FROM likes WHERE from_id = ? OR to_id = ?', id, id)
+    await tx.run('DELETE FROM passes WHERE from_id = ? OR to_id = ?', id, id)
+    await tx.run('DELETE FROM users WHERE id = ?', id)
+  })
   res.status(204).end()
 })
 

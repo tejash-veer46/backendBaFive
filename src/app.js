@@ -7,7 +7,10 @@ import matchRoutes from './routes/matches.js'
 
 const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://localhost:4173')
   .split(',')
-  .map((o) => o.trim())
+  .map((o) => o.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+  // Hosting dashboards often hand over a bare hostname; treat it as https.
+  .map((o) => (o === '*' || /^https?:\/\//.test(o) ? o : `https://${o}`))
 
 export const app = express()
 

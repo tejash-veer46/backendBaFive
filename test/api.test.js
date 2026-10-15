@@ -1,9 +1,17 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 
-process.env.DB_PATH = ':memory:'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+// A throwaway file DB (libSQL transactions on ':memory:' would open a separate empty database).
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bafive-test-'))
+process.env.DB_PATH = path.join(tmpDir, 'test.db')
 process.env.DEMO_MODE = 'false'
 const { app } = await import('../src/app.js')
+const { ready } = await import('../src/db.js')
+await ready
 
 let server
 let base
@@ -125,4 +133,18 @@ test('passing hides a profile and its like', async () => {
   await api('/api/passes', { method: 'POST', token: dia.token, body: { userId: eli.id } })
   assert.equal((await api('/api/likes/received', { token: dia.token })).data.length, 0)
   assert.ok(!(await api('/api/discover', { token: dia.token })).data.some((p) => p.id === eli.id))
+})
+
+test('deleting an account removes its likes, matches and messages', async () => {
+  const fay = await makeUser('Fay', 'woman', 'men')
+  const gus = await makeUser('Gus', 'man', 'women')
+  await api('/api/likes', { method: 'POST', token: fay.token, body: { userId: gus.id, comment: 'hi!' } })
+  const { data } = await api('/api/likes', { method: 'POST', token: gus.token, body: { userId: fay.id } })
+  assert.equal(data.matched, true)
+  assert.equal((await api('/api/summary', { token: gus.token })).data.unread, 1)
+
+  assert.equal((await api('/api/auth/me', { method: 'DELETE', token: fay.token })).status, 204)
+  assert.equal((await api('/api/auth/me', { token: fay.token })).status, 401)
+  assert.equal((await api('/api/matches', { token: gus.token })).data.length, 0)
+  assert.deepEqual((await api('/api/summary', { token: gus.token })).data, { likes: 0, unread: 0, roses: 1 })
 })

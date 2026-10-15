@@ -1,19 +1,22 @@
-import { DatabaseSync } from 'node:sqlite'
+import { createClient } from '@libsql/client'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const dbFile = process.env.DB_PATH || path.join(__dirname, '../data/bafive.db')
-if (dbFile !== ':memory:') fs.mkdirSync(path.dirname(dbFile), { recursive: true })
+// Remote Turso database when DATABASE_URL is set (production), otherwise a local SQLite file.
+const remoteUrl = process.env.DATABASE_URL
+const localFile = path.resolve(process.env.DB_PATH || path.join(__dirname, '../data/bafive.db'))
+if (!remoteUrl) fs.mkdirSync(path.dirname(localFile), { recursive: true })
 
-export const db = new DatabaseSync(dbFile)
+const client = createClient(
+  remoteUrl
+    ? { url: remoteUrl, authToken: process.env.DATABASE_AUTH_TOKEN }
+    : { url: pathToFileURL(localFile).href },
+)
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     email         TEXT UNIQUE NOT NULL COLLATE NOCASE,
@@ -77,20 +80,38 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_likes_to ON likes(to_id);
   CREATE INDEX IF NOT EXISTS idx_messages_match ON messages(match_id, id);
-`)
+`
 
-export const one = (sql, ...params) => db.prepare(sql).get(...params)
-export const all = (sql, ...params) => db.prepare(sql).all(...params)
-export const run = (sql, ...params) => db.prepare(sql).run(...params)
+// Foreign-key enforcement is per-connection and not guaranteed on remote databases,
+// so deletes are done explicitly in the routes rather than relying on ON DELETE CASCADE.
+export const ready = client.executeMultiple(SCHEMA)
 
-export const transaction = (fn) => {
-  db.exec('BEGIN')
+// Accepts positional args (`one(sql, a, b)`) or a single named-args object (`one(sql, { me: 1 })`).
+const toArgs = (params) =>
+  params.length === 1 && params[0] !== null && typeof params[0] === 'object' ? params[0] : params
+
+const helpers = (exec) => ({
+  one: async (sql, ...params) => (await exec.execute({ sql, args: toArgs(params) })).rows[0],
+  all: async (sql, ...params) => (await exec.execute({ sql, args: toArgs(params) })).rows,
+  run: async (sql, ...params) => {
+    const r = await exec.execute({ sql, args: toArgs(params) })
+    return { changes: r.rowsAffected, lastInsertRowid: Number(r.lastInsertRowid) }
+  },
+})
+
+export const { one, all, run } = helpers(client)
+
+/** Runs `fn` inside a write transaction; `fn` receives { one, all, run } bound to it. */
+export const transaction = async (fn) => {
+  const tx = await client.transaction('write')
   try {
-    const result = fn()
-    db.exec('COMMIT')
+    const result = await fn(helpers(tx))
+    await tx.commit()
     return result
   } catch (err) {
-    db.exec('ROLLBACK')
+    await tx.rollback()
     throw err
+  } finally {
+    tx.close()
   }
 }

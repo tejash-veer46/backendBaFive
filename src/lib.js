@@ -18,21 +18,25 @@ export const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, nex
 
 export const signToken = (userId) => jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' })
 
-export const requireAuth = (req, res, next) => {
+export const requireAuth = wrap(async (req, res, next) => {
   const header = req.headers.authorization || ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : null
-  if (!token) return next(new HttpError(401, 'Not signed in'))
+  if (!token) throw new HttpError(401, 'Not signed in')
+  let sub
   try {
-    const { sub } = jwt.verify(token, JWT_SECRET)
-    const user = one('SELECT * FROM users WHERE id = ?', sub)
-    if (!user) return next(new HttpError(401, 'Account no longer exists'))
-    req.user = user
-    run("UPDATE users SET last_active = datetime('now') WHERE id = ?", user.id)
-    next()
+    ;({ sub } = jwt.verify(token, JWT_SECRET))
   } catch {
-    next(new HttpError(401, 'Session expired, please sign in again'))
+    throw new HttpError(401, 'Session expired, please sign in again')
   }
-}
+  const user = await one('SELECT * FROM users WHERE id = ?', sub)
+  if (!user) throw new HttpError(401, 'Account no longer exists')
+  req.user = user
+  // Only touch last_active every few minutes to avoid a write on every request.
+  if (minutesSince(user.last_active) > 5) {
+    await run("UPDATE users SET last_active = datetime('now') WHERE id = ?", user.id)
+  }
+  next()
+})
 
 const parse = (json, fallback) => {
   try {

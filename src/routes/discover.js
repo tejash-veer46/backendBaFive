@@ -17,16 +17,16 @@ const compatibleSql = `
        OR (u.interested_in = 'women' AND :gender = 'woman'))
 `
 
-const matchBetween = (a, b) => one(
+const matchBetween = (a, b, db = { one }) => db.one(
   'SELECT * FROM matches WHERE user_a = ? AND user_b = ?', Math.min(a, b), Math.max(a, b),
 )
 
 const pairParams = (user) => ({ me: user.id, wants: user.interested_in || 'everyone', gender: user.gender || '' })
 
-router.get('/discover', (req, res) => {
+router.get('/discover', async (req, res) => {
   const me = req.user
   const limit = Math.min(Number(req.query.limit) || 10, 30)
-  const rows = all(`
+  const rows = await all(`
     SELECT u.*, EXISTS(SELECT 1 FROM likes l WHERE l.from_id = u.id AND l.to_id = :me) AS liked_me
     FROM users u
     WHERE ${compatibleSql}
@@ -51,18 +51,18 @@ router.get('/discover', (req, res) => {
   res.json(ranked)
 })
 
-router.get('/profiles/:id', (req, res) => {
-  const row = one('SELECT * FROM users WHERE id = ? AND onboarded = 1', Number(req.params.id))
+router.get('/profiles/:id', async (req, res) => {
+  const row = await one('SELECT * FROM users WHERE id = ? AND onboarded = 1', Number(req.params.id))
   if (!row) throw new HttpError(404, 'Profile not found')
   res.json(publicProfile(row, req.user))
 })
 
-router.get('/roses', (req, res) => {
-  res.json({ remaining: rosesRemaining(req.user.id), perDay: ROSES_PER_DAY })
+router.get('/roses', async (req, res) => {
+  res.json({ remaining: await rosesRemaining(req.user.id), perDay: ROSES_PER_DAY })
 })
 
-const rosesRemaining = (userId) => {
-  const { used } = one(
+const rosesRemaining = async (userId) => {
+  const { used } = await one(
     "SELECT COUNT(*) AS used FROM likes WHERE from_id = ? AND is_rose = 1 AND created_at > datetime('now', '-1 day')",
     userId,
   )
@@ -70,25 +70,25 @@ const rosesRemaining = (userId) => {
 }
 
 // Turns a mutual like into a match. Like comments become the opening messages.
-const createMatch = (aId, bId) => transaction(() => {
-  const existing = matchBetween(aId, bId)
+const createMatch = (aId, bId) => transaction(async (tx) => {
+  const existing = await matchBetween(aId, bId, tx)
   if (existing) return existing
-  const { lastInsertRowid } = run(
+  const { lastInsertRowid } = await tx.run(
     'INSERT INTO matches (user_a, user_b) VALUES (?, ?)', Math.min(aId, bId), Math.max(aId, bId),
   )
-  const comments = all(
+  const comments = await tx.all(
     `SELECT from_id, comment FROM likes
      WHERE ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)) AND comment IS NOT NULL
      ORDER BY created_at, id`,
     aId, bId, bId, aId,
   )
   for (const c of comments) {
-    run('INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', lastInsertRowid, c.from_id, c.comment)
+    await tx.run('INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', lastInsertRowid, c.from_id, c.comment)
   }
-  return one('SELECT * FROM matches WHERE id = ?', lastInsertRowid)
+  return tx.one('SELECT * FROM matches WHERE id = ?', lastInsertRowid)
 })
 
-router.post('/likes', (req, res) => {
+router.post('/likes', async (req, res) => {
   const me = req.user
   const toId = Number(req.body.userId)
   const targetType = ['photo', 'prompt'].includes(req.body.targetType) ? req.body.targetType : 'profile'
@@ -97,44 +97,44 @@ router.post('/likes', (req, res) => {
   const rose = req.body.rose ? 1 : 0
 
   if (toId === me.id) throw new HttpError(400, "You can't like yourself")
-  const target = one('SELECT * FROM users WHERE id = ? AND onboarded = 1', toId)
+  const target = await one('SELECT * FROM users WHERE id = ? AND onboarded = 1', toId)
   if (!target) throw new HttpError(404, 'This person is no longer available')
-  if (matchBetween(me.id, toId)) throw new HttpError(409, "You're already matched")
-  if (one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', me.id, toId)) {
+  if (await matchBetween(me.id, toId)) throw new HttpError(409, "You're already matched")
+  if (await one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', me.id, toId)) {
     throw new HttpError(409, 'You already liked this person')
   }
-  if (rose && rosesRemaining(me.id) === 0) throw new HttpError(429, "You've used today's rose. A new one arrives tomorrow.")
+  if (rose && (await rosesRemaining(me.id)) === 0) throw new HttpError(429, "You've used today's rose. A new one arrives tomorrow.")
 
-  run(
+  await run(
     'INSERT INTO likes (from_id, to_id, target_type, target_index, comment, is_rose) VALUES (?, ?, ?, ?, ?, ?)',
     me.id, toId, targetType, targetIndex, comment, rose,
   )
-  run('DELETE FROM passes WHERE from_id = ? AND to_id = ?', me.id, toId)
+  await run('DELETE FROM passes WHERE from_id = ? AND to_id = ?', me.id, toId)
 
-  if (target.is_demo) demoLikesBack(target, me, { comment, rose })
+  if (target.is_demo) await demoLikesBack(target, me, { comment, rose })
 
-  const theyLikedMe = one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', toId, me.id)
+  const theyLikedMe = await one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', toId, me.id)
   if (!theyLikedMe) return res.status(201).json({ matched: false })
 
-  const match = createMatch(me.id, toId)
+  const match = await createMatch(me.id, toId)
   res.status(201).json({ matched: true, matchId: match.id, profile: publicProfile(target, me) })
 })
 
-router.post('/passes', (req, res) => {
+router.post('/passes', async (req, res) => {
   const toId = Number(req.body.userId)
-  if (!one('SELECT 1 FROM users WHERE id = ?', toId)) throw new HttpError(404, 'Profile not found')
-  run('INSERT OR IGNORE INTO passes (from_id, to_id) VALUES (?, ?)', req.user.id, toId)
+  if (!await one('SELECT 1 FROM users WHERE id = ?', toId)) throw new HttpError(404, 'Profile not found')
+  await run('INSERT OR IGNORE INTO passes (from_id, to_id) VALUES (?, ?)', req.user.id, toId)
   res.status(201).json({ ok: true })
 })
 
-router.delete('/passes/:userId', (req, res) => {
-  run('DELETE FROM passes WHERE from_id = ? AND to_id = ?', req.user.id, Number(req.params.userId))
+router.delete('/passes/:userId', async (req, res) => {
+  await run('DELETE FROM passes WHERE from_id = ? AND to_id = ?', req.user.id, Number(req.params.userId))
   res.status(204).end()
 })
 
-router.get('/likes/received', (req, res) => {
+router.get('/likes/received', async (req, res) => {
   const me = req.user
-  const rows = all(`
+  const rows = await all(`
     SELECT l.id AS like_id, l.target_type, l.target_index, l.comment, l.is_rose, l.created_at AS liked_at, u.*
     FROM likes l JOIN users u ON u.id = l.from_id
     WHERE l.to_id = ? AND u.onboarded = 1
@@ -160,19 +160,19 @@ router.get('/likes/received', (req, res) => {
   })))
 })
 
-router.get('/summary', (req, res) => {
-  const me = req.user.id
-  const { likes } = one(`
-    SELECT COUNT(*) AS likes FROM likes l
-    WHERE l.to_id = ? AND l.from_id NOT IN (SELECT to_id FROM passes WHERE from_id = ?)
-      AND l.from_id NOT IN (SELECT to_id FROM likes WHERE from_id = ?)
-  `, me, me, me)
-  const { unread } = one(`
-    SELECT COUNT(*) AS unread FROM messages m JOIN matches x ON x.id = m.match_id
-    WHERE (x.user_a = ? OR x.user_b = ?) AND m.sender_id != ? AND m.read_at IS NULL
-  `, me, me, me)
-  res.json({ likes, unread, roses: rosesRemaining(me) })
+router.get('/summary', async (req, res) => {
+  // Polled every few seconds by the app, so keep it to a single round-trip.
+  const r = await one(`
+    SELECT
+      (SELECT COUNT(*) FROM likes l
+        WHERE l.to_id = :me AND l.from_id NOT IN (SELECT to_id FROM passes WHERE from_id = :me)
+          AND l.from_id NOT IN (SELECT to_id FROM likes WHERE from_id = :me)) AS likes,
+      (SELECT COUNT(*) FROM messages m JOIN matches x ON x.id = m.match_id
+        WHERE (x.user_a = :me OR x.user_b = :me) AND m.sender_id != :me AND m.read_at IS NULL) AS unread,
+      (SELECT COUNT(*) FROM likes
+        WHERE from_id = :me AND is_rose = 1 AND created_at > datetime('now', '-1 day')) AS roses_used
+  `, { me: req.user.id })
+  res.json({ likes: r.likes, unread: r.unread, roses: Math.max(0, ROSES_PER_DAY - r.roses_used) })
 })
 
-export { createMatch }
 export default router

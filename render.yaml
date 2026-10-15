@@ -1,0 +1,50 @@
+# Render Blueprint: deploys the baFive API and website on Render's free plan.
+# Render dashboard → New → Blueprint → pick this repo. See DEPLOYMENT.md.
+services:
+  # API (this repo)
+  - type: web
+    name: bafive-api
+    runtime: node
+    plan: free
+    branch: master
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      # Turso database (keeps data across restarts; Render's free disk is wiped on every deploy/restart)
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_AUTH_TOKEN
+        sync: false
+      - key: DEMO_MODE
+        value: "true"
+      # Auth uses bearer tokens (no cookies), so allowing any origin is safe.
+      # Lock it down to the site URL later if you prefer, e.g. https://bafive.onrender.com
+      - key: CORS_ORIGIN
+        value: "*"
+
+  # Website (frontend repo)
+  - type: web
+    name: bafive
+    runtime: static
+    repo: https://github.com/tejash-veer46/baFiveApplication
+    branch: main
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    pullRequestPreviewsEnabled: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+    envVars:
+      # The API's public URL, e.g. https://bafive-api.onrender.com (shown on the API's dashboard page)
+      - key: VITE_API_URL
+        sync: false

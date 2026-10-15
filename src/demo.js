@@ -105,14 +105,14 @@ const DEMO_REPLIES = [
   'Sorry, back-to-back meetings! But yes, absolutely',
 ]
 
-export const seedDemo = () => {
+export const seedDemo = async () => {
   if (!DEMO_ENABLED) return
-  if (one('SELECT 1 FROM users WHERE is_demo = 1')) return
+  if (await one('SELECT 1 FROM users WHERE is_demo = 1')) return
 
   for (const [i, p] of PEOPLE.entries()) {
     const [name, gender, interestedIn, year, department, jobTitle, hometown, height, faceId, scenes, interests, prompts] = p
     const month = String((i % 12) + 1).padStart(2, '0')
-    run(
+    await run(
       `INSERT INTO users (email, password_hash, name, birthdate, gender, interested_in, department, job_title,
         hometown, height_cm, photos, prompts, interests, onboarded, is_demo, last_active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now', ?))`,
@@ -134,31 +134,31 @@ const wantsGender = (pref, gender) =>
   pref === 'everyone' || (pref === 'men' && gender === 'man') || (pref === 'women' && gender === 'woman')
 
 // When someone finishes onboarding, a few compatible demo profiles like them.
-export const onNewUser = (user) => {
+export const onNewUser = async (user) => {
   if (!DEMO_ENABLED || user.is_demo) return
-  const candidates = all('SELECT * FROM users WHERE is_demo = 1').filter(
+  const candidates = (await all('SELECT * FROM users WHERE is_demo = 1')).filter(
     (d) => wantsGender(d.interested_in, user.gender) && wantsGender(user.interested_in, d.gender),
   )
   const chosen = candidates.sort(() => Math.random() - 0.5).slice(0, 3)
   const prompts = JSON.parse(user.prompts)
-  chosen.forEach((d, i) => {
+  for (const [i, d] of chosen.entries()) {
     const onPrompt = i === 1 && prompts.length > 0
-    run(
+    await run(
       `INSERT OR IGNORE INTO likes (from_id, to_id, target_type, target_index, comment, is_rose, created_at)
        VALUES (?, ?, ?, 0, ?, ?, datetime('now', ?))`,
       d.id, user.id, onPrompt ? 'prompt' : 'photo',
       i === 2 ? null : pick(onPrompt ? PROMPT_COMMENTS : PHOTO_COMMENTS), i === 0 ? 1 : 0, `-${i * 7} minutes`,
     )
-  })
+  }
 }
 
 // Called right after a real user likes a demo profile.
-export const demoLikesBack = (demo, user, { comment, rose }) => {
+export const demoLikesBack = async (demo, user, { comment, rose }) => {
   if (!DEMO_ENABLED) return
   const keen = likesBackByName.get(demo.name) ?? true
   if (!keen && !comment && !rose) return
   if (!wantsGender(demo.interested_in, user.gender)) return
-  run(
+  await run(
     "INSERT OR IGNORE INTO likes (from_id, to_id, target_type, comment) VALUES (?, ?, 'profile', NULL)",
     demo.id, user.id,
   )
@@ -167,11 +167,11 @@ export const demoLikesBack = (demo, user, { comment, rose }) => {
 export const demoReply = (matchId, demoId) => {
   if (!DEMO_ENABLED) return
   const delay = 2500 + Math.random() * 3000
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
-      if (!one('SELECT 1 FROM matches WHERE id = ?', matchId)) return
-      const { n } = one('SELECT COUNT(*) AS n FROM messages WHERE match_id = ? AND sender_id = ?', matchId, demoId)
-      run('INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', matchId, demoId, DEMO_REPLIES[n % DEMO_REPLIES.length])
+      if (!await one('SELECT 1 FROM matches WHERE id = ?', matchId)) return
+      const { n } = await one('SELECT COUNT(*) AS n FROM messages WHERE match_id = ? AND sender_id = ?', matchId, demoId)
+      await run('INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', matchId, demoId, DEMO_REPLIES[n % DEMO_REPLIES.length])
     } catch (err) {
       console.error('demo reply failed', err)
     }

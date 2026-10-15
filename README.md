@@ -7,9 +7,10 @@ Frontend: [tejash-veer46/baFiveApplication](https://github.com/tejash-veer46/baF
 
 ## Stack
 
-- Node.js **22.13+** (uses the built-in `node:sqlite` — no native modules to compile)
-- Express 4, JWT auth (`jsonwebtoken`), passwords hashed with `bcryptjs`
-- SQLite database file at `data/bafive.db` (created automatically)
+- Node.js 22+, Express 5, JWT auth (`jsonwebtoken`), passwords hashed with `bcryptjs`
+- SQLite via libSQL: a local file (`data/bafive.db`) in development, [Turso](https://turso.tech) in production
+
+**Deploying:** see [DEPLOYMENT.md](DEPLOYMENT.md) (free: Render + Turso, configured by `render.yaml`).
 
 ## Run locally
 
@@ -27,7 +28,9 @@ npm test               # API integration tests (in-memory DB)
 | `PORT`        | `5000`                                      |                                                     |
 | `JWT_SECRET`  | dev-only value                              | **Required** when `NODE_ENV=production`             |
 | `CORS_ORIGIN` | `http://localhost:5173,http://localhost:4173` | Comma-separated list of allowed frontends, or `*` |
-| `DB_PATH`     | `./data/bafive.db`                          | Use `:memory:` for throwaway runs                   |
+| `DATABASE_URL` | —                                          | Turso URL (`libsql://…`). If unset, a local file is used |
+| `DATABASE_AUTH_TOKEN` | —                                   | Turso token                                         |
+| `DB_PATH`     | `./data/bafive.db`                          | Local database file when `DATABASE_URL` is unset    |
 | `DEMO_MODE`   | `true`                                      | Seeds 24 demo profiles (see below)                  |
 
 ### Demo mode
