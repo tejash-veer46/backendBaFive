@@ -1,6 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { HttpError } from './lib.js'
+import { trackDbTiming } from './db.js'
 import authRoutes from './routes/auth.js'
 import discoverRoutes from './routes/discover.js'
 import matchRoutes from './routes/matches.js'
@@ -14,8 +15,10 @@ const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http:/
 
 export const app = express()
 
+app.use(trackDbTiming)
 app.use(cors({
   origin: allowedOrigins.includes('*') ? true : allowedOrigins,
+  exposedHeaders: ['Server-Timing'],
 }))
 // Photos are sent as compressed data URLs, so allow reasonably large bodies.
 app.use(express.json({ limit: '12mb' }))

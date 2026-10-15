@@ -133,35 +133,39 @@ const pick = (arr) => arr[Math.floor(Math.random() * arr.length)]
 const wantsGender = (pref, gender) =>
   pref === 'everyone' || (pref === 'men' && gender === 'man') || (pref === 'women' && gender === 'woman')
 
-// When someone finishes onboarding, a few compatible demo profiles like them.
-export const onNewUser = async (user) => {
-  if (!DEMO_ENABLED || user.is_demo) return
-  const candidates = (await all('SELECT * FROM users WHERE is_demo = 1')).filter(
-    (d) => wantsGender(d.interested_in, user.gender) && wantsGender(user.interested_in, d.gender),
-  )
-  const chosen = candidates.sort(() => Math.random() - 0.5).slice(0, 3)
-  const prompts = JSON.parse(user.prompts)
-  for (const [i, d] of chosen.entries()) {
-    const onPrompt = i === 1 && prompts.length > 0
-    await run(
-      `INSERT OR IGNORE INTO likes (from_id, to_id, target_type, target_index, comment, is_rose, created_at)
-       VALUES (?, ?, ?, 0, ?, ?, datetime('now', ?))`,
-      d.id, user.id, onPrompt ? 'prompt' : 'photo',
-      i === 2 ? null : pick(onPrompt ? PROMPT_COMMENTS : PHOTO_COMMENTS), i === 0 ? 1 : 0, `-${i * 7} minutes`,
+// When someone finishes onboarding, a few compatible demo profiles like them: the first with a rose,
+// the second on a prompt (if they have one), the third without a comment.
+// Returns a single statement for `batch`, so it rides along with the profile update.
+export const newUserLikes = (user) => {
+  if (!DEMO_ENABLED || user.is_demo) return null
+  const hasPrompts = JSON.parse(user.prompts).length > 0
+  return [`
+    INSERT OR IGNORE INTO likes (from_id, to_id, target_type, target_index, comment, is_rose, created_at)
+    SELECT id, :user, CASE WHEN rn = 2 AND :hasPrompts THEN 'prompt' ELSE 'photo' END, 0,
+      CASE rn WHEN 1 THEN :first WHEN 2 THEN :second END, rn = 1, datetime('now', '-' || ((rn - 1) * 7) || ' minutes')
+    FROM (
+      SELECT id, row_number() OVER (ORDER BY random()) AS rn FROM users d
+      WHERE d.is_demo = 1
+        AND (d.interested_in = 'everyone' OR (d.interested_in = 'men' AND :gender = 'man') OR (d.interested_in = 'women' AND :gender = 'woman'))
+        AND (:wants = 'everyone' OR (:wants = 'men' AND d.gender = 'man') OR (:wants = 'women' AND d.gender = 'woman'))
     )
-  }
+    WHERE rn <= 3
+  `, {
+    user: user.id,
+    gender: user.gender || '',
+    wants: user.interested_in || 'everyone',
+    hasPrompts: hasPrompts ? 1 : 0,
+    first: pick(PHOTO_COMMENTS),
+    second: pick(hasPrompts ? PROMPT_COMMENTS : PHOTO_COMMENTS),
+  }]
 }
 
-// Called right after a real user likes a demo profile.
-export const demoLikesBack = async (demo, user, { comment, rose }) => {
-  if (!DEMO_ENABLED) return
+// Whether a demo profile likes a real user back right after being liked.
+export const demoLikesBack = (demo, user, { comment, rose }) => {
+  if (!DEMO_ENABLED || !demo.is_demo) return false
   const keen = likesBackByName.get(demo.name) ?? true
-  if (!keen && !comment && !rose) return
-  if (!wantsGender(demo.interested_in, user.gender)) return
-  await run(
-    "INSERT OR IGNORE INTO likes (from_id, to_id, target_type, comment) VALUES (?, ?, 'profile', NULL)",
-    demo.id, user.id,
-  )
+  if (!keen && !comment && !rose) return false
+  return wantsGender(demo.interested_in, user.gender)
 }
 
 export const demoReply = (matchId, demoId) => {

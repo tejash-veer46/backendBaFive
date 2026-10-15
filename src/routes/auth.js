@@ -1,8 +1,8 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import { one, run, transaction } from '../db.js'
+import { one, batch, isUniqueViolation } from '../db.js'
 import { HttpError, wrap, signToken, requireAuth, selfProfile, ageFrom } from '../lib.js'
-import { onNewUser } from '../demo.js'
+import { newUserLikes } from '../demo.js'
 
 const router = Router()
 
@@ -28,16 +28,20 @@ router.post('/signup', wrap(async (req, res) => {
   if (typeof password !== 'string' || password.length < 6) {
     throw new HttpError(400, 'Password must be at least 6 characters')
   }
-  if (await one('SELECT id FROM users WHERE email = ?', email)) {
-    throw new HttpError(409, 'An account with this email already exists')
-  }
+  const department = str(req.body.department, 60, 'Department') ?? null
 
   const hash = await bcrypt.hash(password, 10)
-  const { lastInsertRowid } = await run(
-    'INSERT INTO users (email, password_hash, name, department) VALUES (?, ?, ?, ?)',
-    email, hash, name, str(req.body.department, 60, 'Department') ?? null,
-  )
-  const user = await one('SELECT * FROM users WHERE id = ?', lastInsertRowid)
+  // One round-trip: the UNIQUE email constraint catches duplicates.
+  let user
+  try {
+    user = await one(
+      'INSERT INTO users (email, password_hash, name, department) VALUES (?, ?, ?, ?) RETURNING *',
+      email, hash, name, department,
+    )
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, 'An account with this email already exists')
+    throw err
+  }
   res.status(201).json({ token: signToken(user.id), user: selfProfile(user) })
 }))
 
@@ -117,33 +121,30 @@ router.put('/me', requireAuth, async (req, res) => {
   if (b.prompts !== undefined) updates.prompts = JSON.stringify(validatePrompts(b.prompts))
   if (b.interests !== undefined) updates.interests = JSON.stringify(validateInterests(b.interests))
 
+  // Decide onboarding from the merged profile so the whole update is one round-trip.
   const entries = Object.entries(updates).filter(([, v]) => v !== undefined)
-  if (entries.length) {
-    await run(
-      `UPDATE users SET ${entries.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ?`,
-      ...entries.map(([, v]) => v), req.user.id,
-    )
-  }
+  const merged = { ...req.user, ...Object.fromEntries(entries) }
+  const justOnboarded = !req.user.onboarded && !!merged.birthdate && !!merged.gender && JSON.parse(merged.photos).length >= 1
+  if (justOnboarded) entries.push(['onboarded', 1])
 
-  let user = await one('SELECT * FROM users WHERE id = ?', req.user.id)
-  const complete = user.birthdate && user.gender && JSON.parse(user.photos).length >= 1
-  if (complete && !user.onboarded) {
-    await run('UPDATE users SET onboarded = 1 WHERE id = ?', user.id)
-    user = await one('SELECT * FROM users WHERE id = ?', user.id)
-    await onNewUser(user)
-  }
-  res.json(selfProfile(user))
+  const [updated] = await batch([
+    entries.length
+      ? [`UPDATE users SET ${entries.map(([k]) => `${k} = ?`).join(', ')} WHERE id = ? RETURNING *`, ...entries.map(([, v]) => v), req.user.id]
+      : ['SELECT * FROM users WHERE id = ?', req.user.id],
+    justOnboarded && newUserLikes(merged),
+  ])
+  res.json(selfProfile(updated.rows[0]))
 })
 
 router.delete('/me', requireAuth, async (req, res) => {
   const id = req.user.id
-  await transaction(async (tx) => {
-    await tx.run('DELETE FROM messages WHERE sender_id = ? OR match_id IN (SELECT id FROM matches WHERE user_a = ? OR user_b = ?)', id, id, id)
-    await tx.run('DELETE FROM matches WHERE user_a = ? OR user_b = ?', id, id)
-    await tx.run('DELETE FROM likes WHERE from_id = ? OR to_id = ?', id, id)
-    await tx.run('DELETE FROM passes WHERE from_id = ? OR to_id = ?', id, id)
-    await tx.run('DELETE FROM users WHERE id = ?', id)
-  })
+  await batch([
+    ['DELETE FROM messages WHERE sender_id = ? OR match_id IN (SELECT id FROM matches WHERE user_a = ? OR user_b = ?)', id, id, id],
+    ['DELETE FROM matches WHERE user_a = ? OR user_b = ?', id, id],
+    ['DELETE FROM likes WHERE from_id = ? OR to_id = ?', id, id],
+    ['DELETE FROM passes WHERE from_id = ? OR to_id = ?', id, id],
+    ['DELETE FROM users WHERE id = ?', id],
+  ])
   res.status(204).end()
 })
 

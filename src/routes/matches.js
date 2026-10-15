@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { one, all, run, transaction } from '../db.js'
+import { one, all, batch } from '../db.js'
 import { HttpError, requireAuth, publicProfile } from '../lib.js'
 import { demoReply } from '../demo.js'
 
@@ -53,52 +53,61 @@ router.get('/', async (req, res) => {
 })
 
 router.get('/:id', async (req, res) => {
-  const match = await loadMatch(req)
-  const other = await one('SELECT * FROM users WHERE id = ?', otherId(match, req.user.id))
-  res.json({ id: match.id, createdAt: match.created_at, profile: publicProfile(other, req.user) })
+  const row = await one(`
+    SELECT u.*, x.id AS match_id, x.created_at AS matched_at FROM matches x
+    JOIN users u ON u.id = CASE WHEN x.user_a = :me THEN x.user_b ELSE x.user_a END
+    WHERE x.id = :id AND (x.user_a = :me OR x.user_b = :me)
+  `, { id: Number(req.params.id), me: req.user.id })
+  if (!row) throw new HttpError(404, 'This conversation no longer exists')
+  res.json({ id: row.match_id, createdAt: row.matched_at, profile: publicProfile(row, req.user) })
 })
 
 router.delete('/:id', async (req, res) => {
   const match = await loadMatch(req)
   const me = req.user.id
   const other = otherId(match, me)
-  await transaction(async (tx) => {
-    await tx.run('DELETE FROM messages WHERE match_id = ?', match.id)
-    await tx.run('DELETE FROM matches WHERE id = ?', match.id)
-    await tx.run('DELETE FROM likes WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)', me, other, other, me)
-    await tx.run('INSERT OR IGNORE INTO passes (from_id, to_id) VALUES (?, ?), (?, ?)', me, other, other, me)
-  })
+  await batch([
+    ['DELETE FROM messages WHERE match_id = ?', match.id],
+    ['DELETE FROM matches WHERE id = ?', match.id],
+    ['DELETE FROM likes WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)', me, other, other, me],
+    ['INSERT OR IGNORE INTO passes (from_id, to_id) VALUES (?, ?), (?, ?)', me, other, other, me],
+  ])
   res.status(204).end()
 })
 
+// Polled while a chat is open, so membership check, fetch and read receipts share one round-trip.
 router.get('/:id/messages', async (req, res) => {
-  const match = await loadMatch(req)
-  const after = Number(req.query.after) || 0
-  const messages = await all(
-    'SELECT * FROM messages WHERE match_id = ? AND id > ? ORDER BY id',
-    match.id, after,
-  )
-  if (messages.some((m) => m.sender_id !== req.user.id && !m.read_at)) {
-    await run(
-      "UPDATE messages SET read_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE match_id = ? AND sender_id != ? AND read_at IS NULL",
-      match.id, req.user.id,
-    )
-  }
-  res.json(messages.map(toMessage))
+  const p = { id: Number(req.params.id), me: req.user.id }
+  const [match, messages] = await batch([
+    ['SELECT id FROM matches WHERE id = :id AND (user_a = :me OR user_b = :me)', p],
+    [`SELECT m.* FROM messages m JOIN matches x ON x.id = m.match_id
+      WHERE x.id = :id AND (x.user_a = :me OR x.user_b = :me) AND m.id > :after ORDER BY m.id`,
+      { ...p, after: Number(req.query.after) || 0 }],
+    [`UPDATE messages SET read_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+      WHERE match_id IN (SELECT id FROM matches WHERE id = :id AND (user_a = :me OR user_b = :me))
+        AND sender_id != :me AND read_at IS NULL`, p],
+  ])
+  if (!match.rows.length) throw new HttpError(404, 'This conversation no longer exists')
+  res.json(messages.rows.map(toMessage))
 })
 
 router.post('/:id/messages', async (req, res) => {
-  const match = await loadMatch(req)
   const body = typeof req.body.body === 'string' ? req.body.body.trim() : ''
   if (!body) throw new HttpError(400, 'Message cannot be empty')
   if (body.length > 1000) throw new HttpError(400, 'Message is too long')
 
-  const { lastInsertRowid } = await run(
-    'INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', match.id, req.user.id, body,
-  )
-  const other = await one('SELECT is_demo FROM users WHERE id = ?', otherId(match, req.user.id))
-  if (other?.is_demo) demoReply(match.id, otherId(match, req.user.id))
-  res.status(201).json(toMessage(await one('SELECT * FROM messages WHERE id = ?', lastInsertRowid)))
+  const p = { id: Number(req.params.id), me: req.user.id }
+  const [inserted, other] = await batch([
+    [`INSERT INTO messages (match_id, sender_id, body)
+      SELECT id, :me, :body FROM matches WHERE id = :id AND (user_a = :me OR user_b = :me) RETURNING *`, { ...p, body }],
+    [`SELECT u.id, u.is_demo FROM matches x
+      JOIN users u ON u.id = CASE WHEN x.user_a = :me THEN x.user_b ELSE x.user_a END
+      WHERE x.id = :id AND (x.user_a = :me OR x.user_b = :me)`, p],
+  ])
+  const message = inserted.rows[0]
+  if (!message) throw new HttpError(404, 'This conversation no longer exists')
+  if (other.rows[0]?.is_demo) demoReply(message.match_id, other.rows[0].id)
+  res.status(201).json(toMessage(message))
 })
 
 export default router

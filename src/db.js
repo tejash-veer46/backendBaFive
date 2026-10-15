@@ -1,4 +1,5 @@
 import { createClient } from '@libsql/client'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -86,32 +87,56 @@ const SCHEMA = `
 // so deletes are done explicitly in the routes rather than relying on ON DELETE CASCADE.
 export const ready = client.executeMultiple(SCHEMA)
 
+// Per-request DB stats, reported in a Server-Timing header so latency can be measured from outside.
+const timing = new AsyncLocalStorage()
+
+const timed = async (promise) => {
+  const stats = timing.getStore()
+  if (!stats) return promise
+  const start = performance.now()
+  try {
+    return await promise
+  } finally {
+    stats.trips++
+    stats.ms += performance.now() - start
+  }
+}
+
+export const trackDbTiming = (req, res, next) => {
+  const stats = { trips: 0, ms: 0 }
+  const start = performance.now()
+  const writeHead = res.writeHead
+  res.writeHead = function (...args) {
+    const total = performance.now() - start
+    res.setHeader('Server-Timing', `db;dur=${stats.ms.toFixed(1)};desc="${stats.trips} round-trips", total;dur=${total.toFixed(1)}`)
+    return writeHead.apply(this, args)
+  }
+  timing.run(stats, next)
+}
+
 // Accepts positional args (`one(sql, a, b)`) or a single named-args object (`one(sql, { me: 1 })`).
 const toArgs = (params) =>
   params.length === 1 && params[0] !== null && typeof params[0] === 'object' ? params[0] : params
 
-const helpers = (exec) => ({
-  one: async (sql, ...params) => (await exec.execute({ sql, args: toArgs(params) })).rows[0],
-  all: async (sql, ...params) => (await exec.execute({ sql, args: toArgs(params) })).rows,
-  run: async (sql, ...params) => {
-    const r = await exec.execute({ sql, args: toArgs(params) })
-    return { changes: r.rowsAffected, lastInsertRowid: Number(r.lastInsertRowid) }
-  },
-})
+const toResult = (r) => ({ rows: r.rows, changes: r.rowsAffected, lastInsertRowid: Number(r.lastInsertRowid) })
 
-export const { one, all, run } = helpers(client)
+const execute = async (sql, params) => timed(client.execute({ sql, args: toArgs(params) }))
 
-/** Runs `fn` inside a write transaction; `fn` receives { one, all, run } bound to it. */
-export const transaction = async (fn) => {
-  const tx = await client.transaction('write')
-  try {
-    const result = await fn(helpers(tx))
-    await tx.commit()
-    return result
-  } catch (err) {
-    await tx.rollback()
-    throw err
-  } finally {
-    tx.close()
-  }
+export const one = async (sql, ...params) => (await execute(sql, params)).rows[0]
+export const all = async (sql, ...params) => (await execute(sql, params)).rows
+export const run = async (sql, ...params) => toResult(await execute(sql, params))
+
+/**
+ * Runs statements atomically in a single round-trip. Each statement is `[sql, ...params]`;
+ * falsy entries are skipped (handy for conditional statements). Returns one
+ * { rows, changes, lastInsertRowid } per statement, with null for skipped ones.
+ */
+export const batch = async (statements, mode = 'write') => {
+  const present = statements.filter(Boolean)
+  const results = await timed(client.batch(present.map(([sql, ...params]) => ({ sql, args: toArgs(params) })), mode))
+  let i = 0
+  return statements.map((s) => (s ? toResult(results[i++]) : null))
 }
+
+/** True for a UNIQUE / PRIMARY KEY violation, from either the local or the remote driver. */
+export const isUniqueViolation = (err) => /UNIQUE constraint failed|SQLITE_CONSTRAINT_(UNIQUE|PRIMARYKEY)/.test(`${err?.code} ${err?.message}`)

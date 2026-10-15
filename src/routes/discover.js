@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { one, all, run, transaction } from '../db.js'
+import { one, all, run, batch, isUniqueViolation } from '../db.js'
 import { HttpError, requireAuth, publicProfile } from '../lib.js'
 import { demoLikesBack } from '../demo.js'
 
@@ -16,10 +16,6 @@ const compatibleSql = `
        OR (u.interested_in = 'men' AND :gender = 'man')
        OR (u.interested_in = 'women' AND :gender = 'woman'))
 `
-
-const matchBetween = (a, b, db = { one }) => db.one(
-  'SELECT * FROM matches WHERE user_a = ? AND user_b = ?', Math.min(a, b), Math.max(a, b),
-)
 
 const pairParams = (user) => ({ me: user.id, wants: user.interested_in || 'everyone', gender: user.gender || '' })
 
@@ -69,25 +65,8 @@ const rosesRemaining = async (userId) => {
   return Math.max(0, ROSES_PER_DAY - used)
 }
 
-// Turns a mutual like into a match. Like comments become the opening messages.
-const createMatch = (aId, bId) => transaction(async (tx) => {
-  const existing = await matchBetween(aId, bId, tx)
-  if (existing) return existing
-  const { lastInsertRowid } = await tx.run(
-    'INSERT INTO matches (user_a, user_b) VALUES (?, ?)', Math.min(aId, bId), Math.max(aId, bId),
-  )
-  const comments = await tx.all(
-    `SELECT from_id, comment FROM likes
-     WHERE ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)) AND comment IS NOT NULL
-     ORDER BY created_at, id`,
-    aId, bId, bId, aId,
-  )
-  for (const c of comments) {
-    await tx.run('INSERT INTO messages (match_id, sender_id, body) VALUES (?, ?, ?)', lastInsertRowid, c.from_id, c.comment)
-  }
-  return tx.one('SELECT * FROM matches WHERE id = ?', lastInsertRowid)
-})
-
+// Two round-trips: one read to validate, then one batch that records the like and,
+// if it is mutual, creates the match with like comments as the opening messages.
 router.post('/likes', async (req, res) => {
   const me = req.user
   const toId = Number(req.body.userId)
@@ -97,33 +76,57 @@ router.post('/likes', async (req, res) => {
   const rose = req.body.rose ? 1 : 0
 
   if (toId === me.id) throw new HttpError(400, "You can't like yourself")
-  const target = await one('SELECT * FROM users WHERE id = ? AND onboarded = 1', toId)
+  const pair = { me: me.id, to: toId, lo: Math.min(me.id, toId), hi: Math.max(me.id, toId) }
+  const target = await one(`
+    SELECT u.*,
+      EXISTS(SELECT 1 FROM matches WHERE user_a = :lo AND user_b = :hi) AS matched,
+      EXISTS(SELECT 1 FROM likes WHERE from_id = :me AND to_id = :to) AS liked,
+      (SELECT COUNT(*) FROM likes
+        WHERE from_id = :me AND is_rose = 1 AND created_at > datetime('now', '-1 day')) AS roses_used
+    FROM users u WHERE u.id = :to AND u.onboarded = 1
+  `, pair)
   if (!target) throw new HttpError(404, 'This person is no longer available')
-  if (await matchBetween(me.id, toId)) throw new HttpError(409, "You're already matched")
-  if (await one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', me.id, toId)) {
-    throw new HttpError(409, 'You already liked this person')
+  if (target.matched) throw new HttpError(409, "You're already matched")
+  if (target.liked) throw new HttpError(409, 'You already liked this person')
+  if (rose && target.roses_used >= ROSES_PER_DAY) throw new HttpError(429, "You've used today's rose. A new one arrives tomorrow.")
+
+  let results
+  try {
+    results = await batch([
+      ['INSERT INTO likes (from_id, to_id, target_type, target_index, comment, is_rose) VALUES (?, ?, ?, ?, ?, ?)',
+        me.id, toId, targetType, targetIndex, comment, rose],
+      ['DELETE FROM passes WHERE from_id = ? AND to_id = ?', me.id, toId],
+      demoLikesBack(target, me, { comment, rose }) &&
+        ["INSERT OR IGNORE INTO likes (from_id, to_id, target_type, comment) VALUES (?, ?, 'profile', NULL)", toId, me.id],
+      // Mutual like -> match.
+      [`INSERT OR IGNORE INTO matches (user_a, user_b)
+        SELECT :lo, :hi WHERE EXISTS(SELECT 1 FROM likes WHERE from_id = :to AND to_id = :me)`, pair],
+      // Like comments become the opening messages of a brand-new match.
+      [`INSERT INTO messages (match_id, sender_id, body)
+        SELECT x.id, l.from_id, l.comment FROM matches x
+        JOIN likes l ON (l.from_id = :me AND l.to_id = :to) OR (l.from_id = :to AND l.to_id = :me)
+        WHERE x.user_a = :lo AND x.user_b = :hi AND l.comment IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM messages WHERE match_id = x.id)
+        ORDER BY l.created_at, l.id`, pair],
+      ['SELECT id FROM matches WHERE user_a = ? AND user_b = ?', pair.lo, pair.hi],
+    ])
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, 'You already liked this person')
+    throw err
   }
-  if (rose && (await rosesRemaining(me.id)) === 0) throw new HttpError(429, "You've used today's rose. A new one arrives tomorrow.")
 
-  await run(
-    'INSERT INTO likes (from_id, to_id, target_type, target_index, comment, is_rose) VALUES (?, ?, ?, ?, ?, ?)',
-    me.id, toId, targetType, targetIndex, comment, rose,
-  )
-  await run('DELETE FROM passes WHERE from_id = ? AND to_id = ?', me.id, toId)
-
-  if (target.is_demo) await demoLikesBack(target, me, { comment, rose })
-
-  const theyLikedMe = await one('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', toId, me.id)
-  if (!theyLikedMe) return res.status(201).json({ matched: false })
-
-  const match = await createMatch(me.id, toId)
+  const match = results.at(-1).rows[0]
+  if (!match) return res.status(201).json({ matched: false })
   res.status(201).json({ matched: true, matchId: match.id, profile: publicProfile(target, me) })
 })
 
 router.post('/passes', async (req, res) => {
   const toId = Number(req.body.userId)
-  if (!await one('SELECT 1 FROM users WHERE id = ?', toId)) throw new HttpError(404, 'Profile not found')
-  await run('INSERT OR IGNORE INTO passes (from_id, to_id) VALUES (?, ?)', req.user.id, toId)
+  const [found] = await batch([
+    ['SELECT 1 FROM users WHERE id = ?', toId],
+    ['INSERT OR IGNORE INTO passes (from_id, to_id) SELECT ?, id FROM users WHERE id = ?', req.user.id, toId],
+  ])
+  if (!found.rows.length) throw new HttpError(404, 'Profile not found')
   res.status(201).json({ ok: true })
 })
 
