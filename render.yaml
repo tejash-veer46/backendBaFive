@@ -6,6 +6,10 @@ services:
     name: bafive-api
     runtime: node
     plan: free
+    # Next to the Turso database (aws-ap-south-1, Mumbai): each query is one network round-trip,
+    # ~240 ms from the US vs ~40 ms from Singapore. Render can't change a region in place:
+    # delete the service and re-sync the Blueprint to move it.
+    region: singapore
     branch: master
     buildCommand: npm ci
     startCommand: npm start
