@@ -9,8 +9,10 @@ import path from 'node:path'
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bafive-test-'))
 process.env.DB_PATH = path.join(tmpDir, 'test.db')
 process.env.DEMO_MODE = 'false'
+process.env.NODE_ENV = 'test'
 const { app } = await import('../src/app.js')
-const { ready } = await import('../src/db.js')
+const { ready, one, run } = await import('../src/db.js')
+const { outbox } = await import('../src/mail.js')
 await ready
 
 let server
@@ -33,13 +35,26 @@ const api = async (path, { token, method = 'GET', body } = {}) => {
   return { status: res.status, data }
 }
 
+const lastCode = (email, purpose = 'verify') => outbox.findLast((m) => m.to === email && m.purpose === purpose)?.code
+const sentTo = (email, purpose = 'verify') => outbox.filter((m) => m.to === email && m.purpose === purpose).length
+const post = (path, body) => api(path, { method: 'POST', body })
+const wrongCode = (code) => (code === '000000' ? '111111' : '000000')
+// Pretend the resend cooldown has passed.
+const skipCooldown = (email) => run('UPDATE email_codes SET created_at = 0 WHERE email = ?', email)
+
+/** Signs up and verifies the email, returning the verify-email response ({ token, user }). */
+const signupVerified = async (name, email, password = 'secret123') => {
+  const signup = await post('/api/auth/signup', { name, email, password })
+  assert.equal(signup.status, 201)
+  const verified = await post('/api/auth/verify-email', { email, code: lastCode(email) })
+  assert.equal(verified.status, 200)
+  return verified.data
+}
+
 const PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330'
 
 const makeUser = async (name, gender, interestedIn) => {
-  const { data } = await api('/api/auth/signup', {
-    method: 'POST',
-    body: { name, email: `${name.toLowerCase()}@example.com`, password: 'secret123' },
-  })
+  const data = await signupVerified(name, `${name.toLowerCase()}@example.com`)
   const profile = await api('/api/auth/me', {
     method: 'PUT',
     token: data.token,
@@ -61,6 +76,7 @@ test('signup validates input and rejects duplicates', async () => {
 })
 
 test('login and auth guard', async () => {
+  await post('/api/auth/verify-email', { email: 'dupe@x.com', code: lastCode('dupe@x.com') })
   assert.equal((await api('/api/auth/login', { method: 'POST', body: { email: 'dupe@x.com', password: 'nope' } })).status, 401)
   const ok = await api('/api/auth/login', { method: 'POST', body: { email: 'dupe@x.com', password: 'secret1' } })
   assert.equal(ok.status, 200)
@@ -70,7 +86,7 @@ test('login and auth guard', async () => {
 })
 
 test('under-18 birthdays are rejected', async () => {
-  const { data } = await api('/api/auth/signup', { method: 'POST', body: { name: 'Kid', email: 'kid@x.com', password: 'secret1' } })
+  const data = await signupVerified('Kid', 'kid@x.com')
   const year = new Date().getFullYear() - 16
   const res = await api('/api/auth/me', { method: 'PUT', token: data.token, body: { birthdate: `${year}-01-01` } })
   assert.equal(res.status, 400)
@@ -147,4 +163,150 @@ test('deleting an account removes its likes, matches and messages', async () => 
   assert.equal((await api('/api/auth/me', { token: fay.token })).status, 401)
   assert.equal((await api('/api/matches', { token: gus.token })).data.length, 0)
   assert.deepEqual((await api('/api/summary', { token: gus.token })).data, { likes: 0, unread: 0, roses: 1 })
+})
+
+test('signup emails a code; verifying it signs the user in', async () => {
+  const email = 'vera@x.com'
+  const signup = await post('/api/auth/signup', { name: 'Vera', email, password: 'secret1' })
+  assert.equal(signup.status, 201)
+  assert.equal(signup.data.token, undefined, 'no token before the email is verified')
+  assert.equal(signup.data.needsVerification, true)
+  assert.equal(signup.data.codeSent, true)
+  const code = lastCode(email)
+  assert.match(code, /^\d{6}$/)
+
+  // Stored hashed, never in plain text
+  const row = await one("SELECT * FROM email_codes WHERE email = ? AND purpose = 'verify'", email)
+  assert.match(row.code_hash, /^[0-9a-f]{64}$/)
+  assert.ok(!Object.values(row).map(String).includes(code))
+
+  // Unverified login is refused with a flag the app can act on
+  const login = await post('/api/auth/login', { email, password: 'secret1' })
+  assert.equal(login.status, 403)
+  assert.equal(login.data.needsVerification, true)
+  assert.equal(login.data.email, email)
+  assert.equal(sentTo(email), 1, 'no new code inside the cooldown')
+
+  const bad = await post('/api/auth/verify-email', { email, code: wrongCode(code) })
+  assert.equal(bad.status, 400)
+  assert.match(bad.data.error, /4 tries left/)
+  assert.equal((await post('/api/auth/verify-email', { email, code: '12' })).status, 400)
+
+  const ok = await post('/api/auth/verify-email', { email, code })
+  assert.equal(ok.status, 200)
+  assert.ok(ok.data.token)
+  assert.equal(ok.data.user.email, email)
+  assert.equal((await api('/api/auth/me', { token: ok.data.token })).status, 200)
+
+  // The code is single-use, and login now works
+  assert.equal((await post('/api/auth/verify-email', { email, code })).status, 400)
+  assert.equal((await post('/api/auth/login', { email, password: 'secret1' })).status, 200)
+})
+
+test('unverified login resends a code once the cooldown has passed', async () => {
+  const email = 'lou@x.com'
+  await post('/api/auth/signup', { name: 'Lou', email, password: 'secret1' })
+  const first = lastCode(email)
+  await skipCooldown(email)
+  const login = await post('/api/auth/login', { email, password: 'secret1' })
+  assert.equal(login.status, 403)
+  assert.equal(login.data.codeSent, true)
+  assert.equal(sentTo(email), 2)
+  const second = lastCode(email)
+  if (first !== second) assert.equal((await post('/api/auth/verify-email', { email, code: first })).status, 400, 'old code replaced')
+  assert.equal((await post('/api/auth/verify-email', { email, code: second })).status, 200)
+})
+
+test('resend-code has a cooldown and a daily cap', async () => {
+  const email = 'rex@x.com'
+  await post('/api/auth/signup', { name: 'Rex', email, password: 'secret1' })
+
+  const tooSoon = await post('/api/auth/resend-code', { email })
+  assert.equal(tooSoon.status, 429)
+  assert.ok(tooSoon.data.retryAfter > 0 && tooSoon.data.retryAfter <= 60)
+  assert.equal(sentTo(email), 1)
+
+  await skipCooldown(email)
+  assert.equal((await post('/api/auth/resend-code', { email })).status, 200)
+  assert.equal(sentTo(email), 2)
+
+  await run('UPDATE email_codes SET created_at = 0, send_count = 10 WHERE email = ?', email)
+  const capped = await post('/api/auth/resend-code', { email })
+  assert.equal(capped.status, 429)
+  assert.ok(capped.data.retryAfter > 60)
+  assert.equal(sentTo(email), 2)
+
+  // A new UTC day resets the cap
+  await run("UPDATE email_codes SET send_day = '2000-01-01' WHERE email = ?", email)
+  assert.equal((await post('/api/auth/resend-code', { email })).status, 200)
+  assert.equal(sentTo(email), 3)
+
+  // Nothing is sent for unknown or already verified accounts
+  assert.equal((await post('/api/auth/resend-code', { email: 'nobody@x.com' })).status, 200)
+  assert.equal(sentTo('nobody@x.com'), 0)
+  assert.equal((await post('/api/auth/resend-code', { email: 'vera@x.com' })).status, 200)
+  assert.equal(sentTo('vera@x.com'), 1)
+})
+
+test('codes expire and lock after 5 wrong tries', async () => {
+  const email = 'eve@x.com'
+  await post('/api/auth/signup', { name: 'Eve', email, password: 'secret1' })
+  const code = lastCode(email)
+
+  await run('UPDATE email_codes SET expires_at = 0 WHERE email = ?', email)
+  const expired = await post('/api/auth/verify-email', { email, code })
+  assert.equal(expired.status, 400)
+  assert.match(expired.data.error, /expired/)
+
+  await skipCooldown(email)
+  assert.equal((await post('/api/auth/resend-code', { email })).status, 200)
+  const fresh = lastCode(email)
+  for (let i = 0; i < 5; i++) assert.equal((await post('/api/auth/verify-email', { email, code: wrongCode(fresh) })).status, 400)
+  const locked = await post('/api/auth/verify-email', { email, code: fresh })
+  assert.equal(locked.status, 429, 'even the right code is refused after 5 wrong tries')
+})
+
+test('accounts created before verification existed count as verified', async () => {
+  const bcrypt = (await import('bcryptjs')).default
+  await run("INSERT INTO users (email, password_hash, name) VALUES ('old@x.com', ?, 'Old')", await bcrypt.hash('secret1', 4))
+  assert.equal((await post('/api/auth/login', { email: 'old@x.com', password: 'secret1' })).status, 200)
+})
+
+test('forgot and reset password', async () => {
+  const email = 'pat@x.com'
+  await signupVerified('Pat', email, 'oldpass1')
+
+  // Same answer whether or not the account exists, and nothing is sent for unknown emails
+  const unknown = await post('/api/auth/forgot-password', { email: 'ghost@x.com' })
+  assert.deepEqual([unknown.status, unknown.data], [200, { ok: true }])
+  assert.equal(sentTo('ghost@x.com', 'reset'), 0)
+  const known = await post('/api/auth/forgot-password', { email })
+  assert.deepEqual([known.status, known.data], [200, { ok: true }])
+  const code = lastCode(email, 'reset')
+  assert.match(code, /^\d{6}$/)
+
+  // Throttled requests still answer 200 but send nothing
+  assert.deepEqual((await post('/api/auth/forgot-password', { email })).data, { ok: true })
+  assert.deepEqual((await post('/api/auth/resend-code', { email, purpose: 'reset' })).data, { ok: true })
+  assert.equal(sentTo(email, 'reset'), 1)
+
+  assert.equal((await post('/api/auth/reset-password', { email, code: wrongCode(code), newPassword: 'newpass1' })).status, 400)
+  assert.equal((await post('/api/auth/reset-password', { email, code, newPassword: '123' })).status, 400)
+  assert.equal((await post('/api/auth/reset-password', { email: 'ghost@x.com', code, newPassword: 'newpass1' })).status, 400)
+
+  const reset = await post('/api/auth/reset-password', { email, code, newPassword: 'newpass1' })
+  assert.equal(reset.status, 200)
+  assert.ok(reset.data.token)
+  assert.equal((await post('/api/auth/reset-password', { email, code, newPassword: 'again123' })).status, 400, 'single use')
+  assert.equal((await post('/api/auth/login', { email, password: 'oldpass1' })).status, 401)
+  assert.equal((await post('/api/auth/login', { email, password: 'newpass1' })).status, 200)
+})
+
+test('resetting the password also verifies the email', async () => {
+  const email = 'quinn@x.com'
+  await post('/api/auth/signup', { name: 'Quinn', email, password: 'secret1' })
+  await post('/api/auth/forgot-password', { email })
+  const reset = await post('/api/auth/reset-password', { email, code: lastCode(email, 'reset'), newPassword: 'newpass1' })
+  assert.equal(reset.status, 200)
+  assert.equal((await post('/api/auth/login', { email, password: 'newpass1' })).status, 200)
 })

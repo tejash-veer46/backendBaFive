@@ -30,6 +30,13 @@ services:
       # Lock it down to the site URL later if you prefer, e.g. https://bafive.onrender.com
       - key: CORS_ORIGIN
         value: "*"
+      # Verification and password-reset codes are emailed through Brevo's HTTP API (free: 300/day).
+      # Paste the Brevo API key in the Render dashboard; MAIL_FROM must be a sender verified in Brevo,
+      # e.g. "baFive <you@gmail.com>". Without a key the API only logs codes to its console.
+      - key: BREVO_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false
 
   # Website (frontend repo)
   - type: web

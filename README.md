@@ -32,6 +32,8 @@ npm test               # API integration tests (in-memory DB)
 | `DATABASE_AUTH_TOKEN` | —                                   | Turso token                                         |
 | `DB_PATH`     | `./data/bafive.db`                          | Local database file when `DATABASE_URL` is unset    |
 | `DEMO_MODE`   | `true`                                      | Seeds 24 demo profiles (see below)                  |
+| `BREVO_API_KEY` | —                                         | Brevo API key for emailing codes. If unset, codes are printed to the console |
+| `MAIL_FROM`   | —                                           | Sender verified in Brevo, e.g. `baFive <you@gmail.com>` |
 
 ### Demo mode
 
@@ -42,12 +44,16 @@ cannot sign in. Set `DEMO_MODE=false` before a real launch.
 
 ## API
 
-All endpoints except signup/login need `Authorization: Bearer <token>`. Errors are `{ "error": "message" }`.
+All endpoints except the account ones (signup, login, codes, password reset) need `Authorization: Bearer <token>`. Errors are `{ "error": "message" }`.
 
 | Method & path                          | Purpose                                                                 |
 | -------------------------------------- | ----------------------------------------------------------------------- |
-| `POST /api/auth/signup`                | `{ name, email, password }` → `{ token, user }`                         |
-| `POST /api/auth/login`                 | `{ email, password }` → `{ token, user }`                               |
+| `POST /api/auth/signup`                | `{ name, email, password }` → `201 { needsVerification, email, codeSent }`; emails a 6-digit code |
+| `POST /api/auth/verify-email`          | `{ email, code }` → `{ token, user }`                                   |
+| `POST /api/auth/resend-code`           | `{ email }` → `{ ok }`, or `429 { retryAfter }` (60 s cooldown, 10 codes a day) |
+| `POST /api/auth/login`                 | `{ email, password }` → `{ token, user }`; unverified accounts get `403 { needsVerification, email }` and a fresh code |
+| `POST /api/auth/forgot-password`       | `{ email }` → always `{ ok: true }`; emails a reset code if the account exists |
+| `POST /api/auth/reset-password`        | `{ email, code, newPassword }` → `{ token, user }`                      |
 | `GET /api/auth/me`                     | Current user                                                            |
 | `PUT /api/auth/me`                     | Update profile: `birthdate, gender, interestedIn, photos[], prompts[], interests[], …` |
 | `DELETE /api/auth/me`                  | Delete account and all its data                                         |
@@ -63,5 +69,8 @@ All endpoints except signup/login need `Authorization: Bearer <token>`. Errors a
 | `DELETE /api/matches/:id`              | Unmatch (removes chat, hides both from each other)                      |
 | `GET /api/matches/:id/messages?after=` | Messages (newer than `after`), marks them read                          |
 | `POST /api/matches/:id/messages`       | `{ body }`                                                              |
+
+Codes expire after 10 minutes and allow 5 tries. They are stored as a SHA-256 hash peppered with
+`JWT_SECRET`, one per email and purpose. Accounts created before verification existed count as verified.
 
 Photos are HTTPS URLs or compressed `data:image/...` URLs (the frontend resizes uploads to ≤1080px).

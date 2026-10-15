@@ -36,5 +36,6 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Upload is too large' })
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON body' })
   if (!(err instanceof HttpError)) console.error(err)
-  res.status(err.status || 500).json({ error: err instanceof HttpError ? err.message : 'Something went wrong' })
+  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...err.extra })
+  res.status(err.status || 500).json({ error: 'Something went wrong' })
 })

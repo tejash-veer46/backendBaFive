@@ -2,6 +2,7 @@ import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { one, batch, isUniqueViolation } from '../db.js'
 import { HttpError, wrap, signToken, requireAuth, selfProfile, ageFrom } from '../lib.js'
+import { issueCode, deliver, waitFor, normalizeCode, checkCode } from '../codes.js'
 import { newUserLikes } from '../demo.js'
 
 const router = Router()
@@ -19,30 +20,79 @@ const str = (value, max, field) => {
   return trimmed || null
 }
 
+const emailFrom = (body) => {
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+  if (!email || email.length > 120 || !EMAIL_RE.test(email)) throw new HttpError(400, 'Please enter a valid email')
+  return email
+}
+
+const checkPassword = (password) => {
+  if (typeof password !== 'string' || password.length < 6) {
+    throw new HttpError(400, 'Password must be at least 6 characters')
+  }
+}
+
+// New accounts start unverified and get a code by email; the token comes from /verify-email.
 router.post('/signup', wrap(async (req, res) => {
   const name = str(req.body.name, 50, 'Name')
   const email = str(req.body.email, 120, 'Email')?.toLowerCase()
   const { password } = req.body
   if (!name) throw new HttpError(400, 'Please tell us your name')
   if (!email || !EMAIL_RE.test(email)) throw new HttpError(400, 'Please enter a valid email')
-  if (typeof password !== 'string' || password.length < 6) {
-    throw new HttpError(400, 'Password must be at least 6 characters')
-  }
+  checkPassword(password)
   const department = str(req.body.department, 60, 'Department') ?? null
 
   const hash = await bcrypt.hash(password, 10)
-  // One round-trip: the UNIQUE email constraint catches duplicates.
-  let user
+  const [codeStatement, code] = issueCode(email, 'verify')
+  // One round-trip: the UNIQUE email constraint catches duplicates and rolls back the code too.
+  let issued
   try {
-    user = await one(
-      'INSERT INTO users (email, password_hash, name, department) VALUES (?, ?, ?, ?) RETURNING *',
-      email, hash, name, department,
-    )
+    ;[, issued] = await batch([
+      ['INSERT INTO users (email, password_hash, name, department, email_verified) VALUES (?, ?, ?, ?, 0)', email, hash, name, department],
+      codeStatement,
+    ])
   } catch (err) {
     if (isUniqueViolation(err)) throw new HttpError(409, 'An account with this email already exists')
     throw err
   }
-  res.status(201).json({ token: signToken(user.id), user: selfProfile(user) })
+  const codeSent = issued.rows.length > 0 && (await deliver(email, code, 'verify'))
+  res.status(201).json({ needsVerification: true, email, codeSent })
+}))
+
+router.post('/verify-email', wrap(async (req, res) => {
+  const email = emailFrom(req.body)
+  const code = normalizeCode(req.body.code)
+  await checkCode(email, 'verify', code)
+  const [updated] = await batch([
+    ['UPDATE users SET email_verified = 1 WHERE email = ? RETURNING *', email],
+    ["DELETE FROM email_codes WHERE email = ? AND purpose = 'verify'", email],
+  ])
+  const user = updated.rows[0]
+  if (!user) throw new HttpError(400, 'No account uses this email')
+  res.json({ token: signToken(user.id), user: selfProfile(user) })
+}))
+
+router.post('/resend-code', wrap(async (req, res) => {
+  const email = emailFrom(req.body)
+  // Reset codes are re-sent the same way they were first requested, without revealing whether the account exists.
+  if (req.body.purpose === 'reset') return forgotPassword(email, res)
+
+  const [codeStatement, code] = issueCode(email, 'verify', 'email_verified = 0')
+  const [issued, current] = await batch([
+    codeStatement,
+    ["SELECT created_at, send_day, send_count FROM email_codes WHERE email = ? AND purpose = 'verify'", email],
+  ])
+  if (issued.rows.length) {
+    if (!(await deliver(email, code, 'verify'))) throw new HttpError(502, "We couldn't send the email. Please try again in a minute.")
+    return res.json({ ok: true })
+  }
+  const wait = waitFor(current.rows[0])
+  if (wait) {
+    const message = wait > 60 ? "You've asked for a lot of codes today. Please try again tomorrow." : `Please wait ${wait}s before asking for another code.`
+    throw new HttpError(429, message, { retryAfter: wait })
+  }
+  // Already verified or no such account: nothing to send.
+  res.json({ ok: true })
 }))
 
 router.post('/login', wrap(async (req, res) => {
@@ -50,6 +100,42 @@ router.post('/login', wrap(async (req, res) => {
   const user = email && await one('SELECT * FROM users WHERE email = ?', email)
   const ok = user && (await bcrypt.compare(String(req.body.password ?? ''), user.password_hash))
   if (!ok) throw new HttpError(401, 'Incorrect email or password')
+  if (!user.email_verified) {
+    // Send a fresh code unless one went out in the last minute.
+    const [codeStatement, code] = issueCode(user.email, 'verify')
+    const issued = await one(...codeStatement)
+    const codeSent = !!issued && (await deliver(user.email, code, 'verify'))
+    throw new HttpError(403, codeSent ? 'Please verify your email. We just sent you a new code.' : 'Please verify your email with the code we sent you.', {
+      needsVerification: true, email: user.email, codeSent,
+    })
+  }
+  res.json({ token: signToken(user.id), user: selfProfile(user) })
+}))
+
+// Always answers the same way so it can't be used to find out which emails have accounts.
+const forgotPassword = async (email, res) => {
+  const [codeStatement, code] = issueCode(email, 'reset', 'true')
+  const issued = await one(...codeStatement)
+  // Not awaited, so the response time doesn't reveal whether an email was sent.
+  if (issued) deliver(email, code, 'reset').catch((err) => console.error('[mail]', err))
+  res.json({ ok: true })
+}
+
+router.post('/forgot-password', wrap(async (req, res) => forgotPassword(emailFrom(req.body), res)))
+
+router.post('/reset-password', wrap(async (req, res) => {
+  const email = emailFrom(req.body)
+  const code = normalizeCode(req.body.code)
+  checkPassword(req.body.newPassword)
+  await checkCode(email, 'reset', code)
+  const hash = await bcrypt.hash(req.body.newPassword, 10)
+  // Receiving the code also proves the user owns the email.
+  const [updated] = await batch([
+    ['UPDATE users SET password_hash = ?, email_verified = 1 WHERE email = ? RETURNING *', hash, email],
+    ['DELETE FROM email_codes WHERE email = ?', email],
+  ])
+  const user = updated.rows[0]
+  if (!user) throw new HttpError(400, 'No account uses this email')
   res.json({ token: signToken(user.id), user: selfProfile(user) })
 }))
 
@@ -139,6 +225,7 @@ router.put('/me', requireAuth, async (req, res) => {
 router.delete('/me', requireAuth, async (req, res) => {
   const id = req.user.id
   await batch([
+    ['DELETE FROM email_codes WHERE email = ?', req.user.email],
     ['DELETE FROM messages WHERE sender_id = ? OR match_id IN (SELECT id FROM matches WHERE user_a = ? OR user_b = ?)', id, id, id],
     ['DELETE FROM matches WHERE user_a = ? OR user_b = ?', id, id],
     ['DELETE FROM likes WHERE from_id = ? OR to_id = ?', id, id],

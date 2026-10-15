@@ -7,9 +7,11 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
 }
 
 export class HttpError extends Error {
-  constructor(status, message) {
+  /** `extra` fields are added to the JSON error body, e.g. { needsVerification: true }. */
+  constructor(status, message, extra) {
     super(message)
     this.status = status
+    this.extra = extra
   }
 }
 

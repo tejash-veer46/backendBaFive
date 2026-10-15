@@ -37,6 +37,8 @@ const SCHEMA = `
     interests     TEXT NOT NULL DEFAULT '[]',
     onboarded     INTEGER NOT NULL DEFAULT 0,
     is_demo       INTEGER NOT NULL DEFAULT 0,
+    -- New signups are inserted with 0; everything else (older accounts, demo profiles) counts as verified.
+    email_verified INTEGER NOT NULL DEFAULT 1,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     last_active   TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -79,13 +81,31 @@ const SCHEMA = `
     read_at    TEXT
   );
 
+  -- One live code per email and purpose. Rows stay after expiry so the daily send cap keeps counting.
+  CREATE TABLE IF NOT EXISTS email_codes (
+    email      TEXT NOT NULL COLLATE NOCASE,
+    purpose    TEXT NOT NULL CHECK (purpose IN ('verify', 'reset')),
+    code_hash  TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,          -- epoch ms
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,          -- epoch ms of the latest send (drives the resend cooldown)
+    send_day   TEXT NOT NULL,             -- UTC date of send_count
+    send_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (email, purpose)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_likes_to ON likes(to_id);
   CREATE INDEX IF NOT EXISTS idx_messages_match ON messages(match_id, id);
 `
 
 // Foreign-key enforcement is per-connection and not guaranteed on remote databases,
 // so deletes are done explicitly in the routes rather than relying on ON DELETE CASCADE.
-export const ready = client.executeMultiple(SCHEMA)
+export const ready = client.executeMultiple(SCHEMA).then(() =>
+  // Databases created before email verification: add the column (existing users count as verified).
+  client.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1').catch((err) => {
+    if (!/duplicate column/i.test(err.message)) throw err
+  }),
+)
 
 // Per-request DB stats, reported in a Server-Timing header so latency can be measured from outside.
 const timing = new AsyncLocalStorage()
