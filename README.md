@@ -32,6 +32,7 @@ npm test               # API integration tests (in-memory DB)
 | `DATABASE_AUTH_TOKEN` | —                                   | Turso token                                         |
 | `DB_PATH`     | `./data/bafive.db`                          | Local database file when `DATABASE_URL` is unset    |
 | `DEMO_MODE`   | `true`                                      | Seeds 24 demo profiles (see below)                  |
+| `EMAIL_VERIFICATION` | off                                     | `true` turns on emailed codes (signup verification, password reset). Off: signup signs in directly and the code endpoints answer 503 |
 | `BREVO_API_KEY` | —                                         | Brevo API key for emailing codes. If unset, codes are printed to the console |
 | `MAIL_FROM`   | —                                           | Sender verified in Brevo, e.g. `baFive <you@gmail.com>` |
 

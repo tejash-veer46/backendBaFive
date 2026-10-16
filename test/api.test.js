@@ -10,6 +10,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bafive-test-'))
 process.env.DB_PATH = path.join(tmpDir, 'test.db')
 process.env.DEMO_MODE = 'false'
 process.env.NODE_ENV = 'test'
+process.env.EMAIL_VERIFICATION = 'true'
 const { app } = await import('../src/app.js')
 const { ready, one, run } = await import('../src/db.js')
 const { outbox } = await import('../src/mail.js')
@@ -309,4 +310,27 @@ test('resetting the password also verifies the email', async () => {
   const reset = await post('/api/auth/reset-password', { email, code: lastCode(email, 'reset'), newPassword: 'newpass1' })
   assert.equal(reset.status, 200)
   assert.equal((await post('/api/auth/login', { email, password: 'newpass1' })).status, 200)
+})
+
+test('with email codes turned off, signup signs in straight away', async () => {
+  process.env.EMAIL_VERIFICATION = 'false'
+  try {
+    const email = 'nocode@x.com'
+    const signup = await post('/api/auth/signup', { name: 'Noa', email, password: 'secret1' })
+    assert.equal(signup.status, 201)
+    assert.ok(signup.data.token)
+    assert.equal(sentTo(email), 0)
+    assert.equal((await api('/api/auth/me', { token: signup.data.token })).status, 200)
+    assert.equal((await post('/api/auth/signup', { name: 'Noa', email, password: 'secret1' })).status, 409)
+
+    // Unverified accounts from before can log in, and code endpoints are switched off
+    await post('/api/auth/login', { email, password: 'secret1' }).then((r) => assert.equal(r.status, 200))
+    for (const path of ['verify-email', 'resend-code', 'forgot-password', 'reset-password']) {
+      assert.equal((await post(`/api/auth/${path}`, { email, code: '123456', newPassword: 'newpass1' })).status, 503, path)
+    }
+  } finally {
+    process.env.EMAIL_VERIFICATION = 'true'
+  }
+  // Turning codes back on asks that account to verify
+  assert.equal((await post('/api/auth/login', { email: 'nocode@x.com', password: 'secret1' })).status, 403)
 })

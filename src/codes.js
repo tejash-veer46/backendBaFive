@@ -4,6 +4,12 @@ import { one, run } from './db.js'
 import { HttpError, JWT_SECRET } from './lib.js'
 import { sendCode } from './mail.js'
 
+/**
+ * Email codes are off unless EMAIL_VERIFICATION=true: signup then signs in straight away, unverified
+ * accounts can log in, and the code / password-reset endpoints answer 503. Read per request so tests can flip it.
+ */
+export const emailCodesEnabled = () => process.env.EMAIL_VERIFICATION === 'true'
+
 export const CODE_TTL_MS = 10 * 60_000
 export const RESEND_COOLDOWN_MS = 60_000
 export const MAX_ATTEMPTS = 5

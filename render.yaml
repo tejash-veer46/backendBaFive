@@ -33,6 +33,9 @@ services:
       # Verification and password-reset codes are emailed through Brevo's HTTP API (free: 300/day).
       # Paste the Brevo API key in the Render dashboard; MAIL_FROM must be a sender verified in Brevo,
       # e.g. "baFive <you@gmail.com>". Without a key the API only logs codes to its console.
+      # Emailed codes stay off until this is "true" (set it in the dashboard once Brevo sending works).
+      - key: EMAIL_VERIFICATION
+        sync: false
       - key: BREVO_API_KEY
         sync: false
       - key: MAIL_FROM

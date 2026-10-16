@@ -2,7 +2,7 @@ import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { one, batch, isUniqueViolation } from '../db.js'
 import { HttpError, wrap, signToken, requireAuth, selfProfile, ageFrom } from '../lib.js'
-import { issueCode, deliver, waitFor, normalizeCode, checkCode } from '../codes.js'
+import { issueCode, deliver, waitFor, normalizeCode, checkCode, emailCodesEnabled } from '../codes.js'
 import { newUserLikes } from '../demo.js'
 
 const router = Router()
@@ -26,6 +26,11 @@ const emailFrom = (body) => {
   return email
 }
 
+const requireEmailCodes = (req, res, next) => {
+  if (!emailCodesEnabled()) throw new HttpError(503, 'Email codes are turned off for now. Please try again later.')
+  next()
+}
+
 const checkPassword = (password) => {
   if (typeof password !== 'string' || password.length < 6) {
     throw new HttpError(400, 'Password must be at least 6 characters')
@@ -33,6 +38,7 @@ const checkPassword = (password) => {
 }
 
 // New accounts start unverified and get a code by email; the token comes from /verify-email.
+// With email codes off, the account (still unverified) is signed in straight away.
 router.post('/signup', wrap(async (req, res) => {
   const name = str(req.body.name, 50, 'Name')
   const email = str(req.body.email, 120, 'Email')?.toLowerCase()
@@ -43,14 +49,23 @@ router.post('/signup', wrap(async (req, res) => {
   const department = str(req.body.department, 60, 'Department') ?? null
 
   const hash = await bcrypt.hash(password, 10)
+  const insert = ['INSERT INTO users (email, password_hash, name, department, email_verified) VALUES (?, ?, ?, ?, 0) RETURNING *', email, hash, name, department]
+  if (!emailCodesEnabled()) {
+    let user
+    try {
+      user = await one(...insert)
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new HttpError(409, 'An account with this email already exists')
+      throw err
+    }
+    return res.status(201).json({ token: signToken(user.id), user: selfProfile(user) })
+  }
+
   const [codeStatement, code] = issueCode(email, 'verify')
   // One round-trip: the UNIQUE email constraint catches duplicates and rolls back the code too.
   let issued
   try {
-    ;[, issued] = await batch([
-      ['INSERT INTO users (email, password_hash, name, department, email_verified) VALUES (?, ?, ?, ?, 0)', email, hash, name, department],
-      codeStatement,
-    ])
+    ;[, issued] = await batch([insert, codeStatement])
   } catch (err) {
     if (isUniqueViolation(err)) throw new HttpError(409, 'An account with this email already exists')
     throw err
@@ -59,7 +74,7 @@ router.post('/signup', wrap(async (req, res) => {
   res.status(201).json({ needsVerification: true, email, codeSent })
 }))
 
-router.post('/verify-email', wrap(async (req, res) => {
+router.post('/verify-email', requireEmailCodes, wrap(async (req, res) => {
   const email = emailFrom(req.body)
   const code = normalizeCode(req.body.code)
   await checkCode(email, 'verify', code)
@@ -72,7 +87,7 @@ router.post('/verify-email', wrap(async (req, res) => {
   res.json({ token: signToken(user.id), user: selfProfile(user) })
 }))
 
-router.post('/resend-code', wrap(async (req, res) => {
+router.post('/resend-code', requireEmailCodes, wrap(async (req, res) => {
   const email = emailFrom(req.body)
   // Reset codes are re-sent the same way they were first requested, without revealing whether the account exists.
   if (req.body.purpose === 'reset') return forgotPassword(email, res)
@@ -100,7 +115,7 @@ router.post('/login', wrap(async (req, res) => {
   const user = email && await one('SELECT * FROM users WHERE email = ?', email)
   const ok = user && (await bcrypt.compare(String(req.body.password ?? ''), user.password_hash))
   if (!ok) throw new HttpError(401, 'Incorrect email or password')
-  if (!user.email_verified) {
+  if (!user.email_verified && emailCodesEnabled()) {
     // Send a fresh code unless one went out in the last minute.
     const [codeStatement, code] = issueCode(user.email, 'verify')
     const issued = await one(...codeStatement)
@@ -121,9 +136,9 @@ const forgotPassword = async (email, res) => {
   res.json({ ok: true })
 }
 
-router.post('/forgot-password', wrap(async (req, res) => forgotPassword(emailFrom(req.body), res)))
+router.post('/forgot-password', requireEmailCodes, wrap(async (req, res) => forgotPassword(emailFrom(req.body), res)))
 
-router.post('/reset-password', wrap(async (req, res) => {
+router.post('/reset-password', requireEmailCodes, wrap(async (req, res) => {
   const email = emailFrom(req.body)
   const code = normalizeCode(req.body.code)
   checkPassword(req.body.newPassword)
