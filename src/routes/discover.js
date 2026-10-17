@@ -117,7 +117,7 @@ router.post('/likes', async (req, res) => {
 
   const match = results.at(-1).rows[0]
   if (!match) return res.status(201).json({ matched: false })
-  res.status(201).json({ matched: true, matchId: match.id, profile: publicProfile(target, me) })
+  res.status(201).json({ matched: true, matchId: match.id, profile: publicProfile(target, me, { socials: true }) })
 })
 
 router.post('/passes', async (req, res) => {

@@ -45,7 +45,7 @@ router.get('/', async (req, res) => {
     lastMessage: r.m_id
       ? toMessage({ id: r.m_id, sender_id: r.m_sender_id, body: r.m_body, created_at: r.m_created_at, read_at: r.m_read_at })
       : null,
-    profile: publicProfile(r, me),
+    profile: publicProfile(r, me, { socials: true }),
   }))
   const activity = (m) => m.lastMessage?.createdAt || m.createdAt
   result.sort((a, b) => activity(b).localeCompare(activity(a)))
@@ -59,7 +59,7 @@ router.get('/:id', async (req, res) => {
     WHERE x.id = :id AND (x.user_a = :me OR x.user_b = :me)
   `, { id: Number(req.params.id), me: req.user.id })
   if (!row) throw new HttpError(404, 'This conversation no longer exists')
-  res.json({ id: row.match_id, createdAt: row.matched_at, profile: publicProfile(row, req.user) })
+  res.json({ id: row.match_id, createdAt: row.matched_at, profile: publicProfile(row, req.user, { socials: true }) })
 })
 
 router.delete('/:id', async (req, res) => {

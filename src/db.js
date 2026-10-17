@@ -35,6 +35,7 @@ const SCHEMA = `
     photos        TEXT NOT NULL DEFAULT '[]',
     prompts       TEXT NOT NULL DEFAULT '[]',
     interests     TEXT NOT NULL DEFAULT '[]',
+    socials       TEXT NOT NULL DEFAULT '{}', -- { github, linkedin, instagram } usernames, shown to matches only
     onboarded     INTEGER NOT NULL DEFAULT 0,
     is_demo       INTEGER NOT NULL DEFAULT 0,
     -- New signups are inserted with 0; everything else (older accounts, demo profiles) counts as verified.
@@ -100,11 +101,15 @@ const SCHEMA = `
 
 // Foreign-key enforcement is per-connection and not guaranteed on remote databases,
 // so deletes are done explicitly in the routes rather than relying on ON DELETE CASCADE.
+// Columns added after launch, for databases created before them (existing users count as verified).
+const ADDED_COLUMNS = [
+  'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1',
+  "ALTER TABLE users ADD COLUMN socials TEXT NOT NULL DEFAULT '{}'",
+]
 export const ready = client.executeMultiple(SCHEMA).then(() =>
-  // Databases created before email verification: add the column (existing users count as verified).
-  client.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1').catch((err) => {
+  Promise.all(ADDED_COLUMNS.map((sql) => client.execute(sql).catch((err) => {
     if (!/duplicate column/i.test(err.message)) throw err
-  }),
+  }))),
 )
 
 // Per-request DB stats, reported in a Server-Timing header so latency can be measured from outside.

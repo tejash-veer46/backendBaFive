@@ -62,7 +62,8 @@ export const ageFrom = (birthdate) => {
 const minutesSince = (sqlDate) => (Date.now() - new Date(sqlDate.replace(' ', 'T') + 'Z').getTime()) / 60000
 
 // Public view of a profile. `viewer` (a users row) adds shared interests.
-export const publicProfile = (row, viewer) => {
+// Social handles are private until people match: pass { socials: true } only for a match.
+export const publicProfile = (row, viewer, { socials = false } = {}) => {
   const interests = parse(row.interests, [])
   const viewerInterests = viewer ? parse(viewer.interests, []) : []
   return {
@@ -81,12 +82,13 @@ export const publicProfile = (row, viewer) => {
     interests,
     sharedInterests: viewer ? interests.filter((i) => viewerInterests.includes(i)) : [],
     activeRecently: minutesSince(row.last_active) < 60 * 24,
+    ...(socials && { socials: parse(row.socials, {}) }),
   }
 }
 
 // The signed-in user's own view, including private settings.
 export const selfProfile = (row) => ({
-  ...publicProfile(row),
+  ...publicProfile(row, null, { socials: true }),
   email: row.email,
   birthdate: row.birthdate,
   interestedIn: row.interested_in,

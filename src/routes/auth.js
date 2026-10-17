@@ -187,6 +187,28 @@ const validateInterests = (interests) => {
   return clean
 }
 
+// Accepts a username or a profile link and keeps just the username.
+const SOCIALS = {
+  github: { label: 'GitHub', prefix: /^(https?:\/\/)?(www\.)?github\.com\//i, pattern: /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/ },
+  linkedin: { label: 'LinkedIn', prefix: /^(https?:\/\/)?([a-z]{2,3}\.)?linkedin\.com\/in\//i, pattern: /^[A-Za-z0-9][A-Za-z0-9_-]{2,99}$/ },
+  instagram: { label: 'Instagram', prefix: /^(https?:\/\/)?(www\.)?instagram\.com\//i, pattern: /^[A-Za-z0-9._]{1,30}$/ },
+}
+
+const validateSocials = (socials) => {
+  if (socials === null || typeof socials !== 'object' || Array.isArray(socials)) throw new HttpError(400, 'Socials must be an object')
+  const clean = {}
+  for (const [key, { label, prefix, pattern }] of Object.entries(SOCIALS)) {
+    const raw = socials[key]
+    if (raw === undefined || raw === null || raw === '') continue
+    if (typeof raw !== 'string') throw new HttpError(400, `${label} must be text`)
+    const handle = raw.trim().replace(prefix, '').replace(/^@/, '').replace(/[/?#].*$/, '')
+    if (!handle) continue
+    if (!pattern.test(handle)) throw new HttpError(400, `That doesn't look like a ${label} username`)
+    clean[key] = handle
+  }
+  return clean
+}
+
 router.put('/me', requireAuth, async (req, res) => {
   const b = req.body
   const updates = {
@@ -221,6 +243,7 @@ router.put('/me', requireAuth, async (req, res) => {
   if (b.photos !== undefined) updates.photos = JSON.stringify(validatePhotos(b.photos))
   if (b.prompts !== undefined) updates.prompts = JSON.stringify(validatePrompts(b.prompts))
   if (b.interests !== undefined) updates.interests = JSON.stringify(validateInterests(b.interests))
+  if (b.socials !== undefined) updates.socials = JSON.stringify(validateSocials(b.socials))
 
   // Decide onboarding from the merged profile so the whole update is one round-trip.
   const entries = Object.entries(updates).filter(([, v]) => v !== undefined)

@@ -334,3 +334,33 @@ test('with email codes turned off, signup signs in straight away', async () => {
   // Turning codes back on asks that account to verify
   assert.equal((await post('/api/auth/login', { email: 'nocode@x.com', password: 'secret1' })).status, 403)
 })
+
+test('social links are cleaned up and only shown to matches', async () => {
+  const sam = await makeUser('Sam', 'woman', 'men')
+  const tom = await makeUser('Tom', 'man', 'women')
+  const saved = await api('/api/auth/me', {
+    method: 'PUT', token: sam.token,
+    body: { socials: { github: 'https://github.com/sam-dev/', linkedin: 'https://www.linkedin.com/in/sam-k-123?trk=x', instagram: '@sam.snaps', twitter: 'ignored' } },
+  })
+  assert.equal(saved.status, 200)
+  assert.deepEqual(saved.data.socials, { github: 'sam-dev', linkedin: 'sam-k-123', instagram: 'sam.snaps' })
+  assert.equal((await api('/api/auth/me', { method: 'PUT', token: sam.token, body: { socials: { instagram: 'not valid!' } } })).status, 400)
+
+  // Not visible before matching
+  const before = (await api('/api/discover', { token: tom.token })).data.find((p) => p.id === sam.id)
+  assert.ok(before)
+  assert.equal(before.socials, undefined)
+  assert.equal((await api(`/api/profiles/${sam.id}`, { token: tom.token })).data.socials, undefined)
+
+  await api('/api/likes', { method: 'POST', token: sam.token, body: { userId: tom.id } })
+  const match = await api('/api/likes', { method: 'POST', token: tom.token, body: { userId: sam.id } })
+  assert.equal(match.data.matched, true)
+  assert.equal(match.data.profile.socials.github, 'sam-dev')
+  const list = (await api('/api/matches', { token: tom.token })).data
+  assert.equal(list.find((m) => m.profile.id === sam.id).profile.socials.instagram, 'sam.snaps')
+  assert.equal((await api(`/api/matches/${match.data.matchId}`, { token: tom.token })).data.profile.socials.linkedin, 'sam-k-123')
+
+  // Clearing a field removes it
+  const cleared = await api('/api/auth/me', { method: 'PUT', token: sam.token, body: { socials: { github: 'sam-dev', linkedin: '', instagram: null } } })
+  assert.deepEqual(cleared.data.socials, { github: 'sam-dev' })
+})

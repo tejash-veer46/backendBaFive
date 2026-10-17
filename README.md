@@ -56,7 +56,7 @@ All endpoints except the account ones (signup, login, codes, password reset) nee
 | `POST /api/auth/forgot-password`       | `{ email }` → always `{ ok: true }`; emails a reset code if the account exists |
 | `POST /api/auth/reset-password`        | `{ email, code, newPassword }` → `{ token, user }`                      |
 | `GET /api/auth/me`                     | Current user                                                            |
-| `PUT /api/auth/me`                     | Update profile: `birthdate, gender, interestedIn, photos[], prompts[], interests[], …` |
+| `PUT /api/auth/me`                     | Update profile: `birthdate, gender, interestedIn, photos[], prompts[], interests[], socials{github,linkedin,instagram}, …` (socials are shown only to matches) |
 | `DELETE /api/auth/me`                  | Delete account and all its data                                         |
 | `GET /api/discover?limit=10`           | Profiles that match both people's preferences, ranked by shared interests |
 | `GET /api/profiles/:id`                | One profile                                                             |
